@@ -1,0 +1,233 @@
+name: 'CI Pipeline - React Self Service - $(Build.BuildId)'
+
+trigger:
+  - dev
+  - qa
+  - main
+
+variables:
+  - name: appName
+    value: 'bo-front-ms-selfservice'
+  - name: buildVersion
+    value: 'latest'
+  - name: operatingSystem
+    value: 'ubuntu-latest'
+  - name: containerRegistryType
+    value: 'Azure Container Registry'
+  - name: imageRegistry
+    value: 'acrdinetartifactory$(Build.SourceBranchName).azurecr.io'
+  - name: azureSubscription
+    value: 'arg-dinet-commons-$(Build.SourceBranchName)'
+  - name: containerRegistryType
+    value: 'Azure Container Registry'
+  - name: sonarServer
+    value: 'https://dev-sonnar.dinet.com.pe'
+  - name: sonarToken
+    value: '980c45c87fe9e48cc300fcfc674e7a8427c13845'
+  - name: acrUrl
+    value: 'acrdinetartifactorydev.azurecr.io'
+  - ${{ if eq(variables['Build.SourceBranchName'], 'dev') }}:
+      - group: 'dev-bo-frontselfservice-variables'
+  - ${{ if eq(variables['Build.SourceBranchName'], 'qa') }}:
+      - group: 'qa-bo-frontselfservice-variables'
+  - ${{ if eq(variables['Build.SourceBranchName'], 'main') }}:
+      - group: 'prod-bo-frontselfservice-variables'
+  - group: 'gradle-config'
+  - name: OWASP_CACHE_DIR
+    value: '$(Pipeline.Workspace)/owasp-cache'
+
+stages:
+  - stage: Build
+    displayName: 'Build Stage'
+    jobs:
+      - job: Build
+        displayName: 'Build Job'
+        pool:
+          vmImage: '$(operatingSystem)'
+        steps:
+          - checkout: self
+          - script: |
+              shortSHA=$(echo "$(Build.SourceVersion)" | cut -c 1-8)
+              echo "##vso[task.setvariable variable=shortSHA]$shortSHA"
+
+              customDate=$(date +'%Y.%m.%d')
+              echo "##vso[task.setvariable variable=customDate]$customDate"
+
+              customVersion="$(Build.BuildId)-$shortSHA-$customDate"
+              echo "##vso[task.setvariable variable=customVersion]$customVersion"
+
+              echo "BuildId: $(Build.BuildId)"
+              echo "SourceVersion: $shortSHA"
+              echo "Date: $customDate"
+              echo "CustomVersion: $customVersion"
+
+              echo "$customVersion" > version.txt
+            displayName: 'set version'
+          - script: |
+              appVersion=$(cat version.txt)
+              echo "##vso[task.setvariable variable=appVersion]$appVersion"
+              echo "Versión leída del archivo: $appVersion"
+            displayName: 'read version'
+
+          - script: |
+              rm -rf node_modules package-lock.json
+            displayName: 'clean node modules'
+
+          - script: |
+              node -v
+              npm install
+              version=$(grep '"version"' package.json | sed -E 's/.*"version": "(.*)".*/\1/')-$(Build.SourceBranchName)-$(Build.BuildId)
+              echo $version
+              npm version "$version" --no-git-tag-version
+              cat package.json
+              echo "##vso[task.setvariable variable=portalVersion]$(echo $version)"
+
+              VITE_APIGATEWAY_URL=$(VITE_APIGATEWAY_URL) \
+              VITE_SERVE_PATH=$(VITE_SERVE_PATH) \
+
+              npm run build
+            displayName: 'Build React App'
+
+          - script: |
+              echo "Preparando directorios..."
+              mkdir -p $(OWASP_CACHE_DIR)
+              mkdir -p dependency-check-report
+
+              echo "Descargando base de datos de Dependency Check..."
+              curl -L -o nvd-latest.zip "https://ascdinetstoragebodev.blob.core.windows.net/nvd-bd/nvd-latest.zip"
+
+              echo "Extrayendo base de datos en $(OWASP_CACHE_DIR)..."
+              unzip -o nvd-latest.zip -d "$(OWASP_CACHE_DIR)"
+
+              echo "Verificando archivos en $(OWASP_CACHE_DIR)..."
+              ls -l "$(OWASP_CACHE_DIR)"
+
+              echo "Descargando Dependency Check tool..."
+              wget https://github.com/dependency-check/DependencyCheck/releases/download/v12.1.0/dependency-check-12.1.0-release.zip
+              unzip dependency-check-12.1.0-release.zip
+              chmod +x dependency-check/bin/dependency-check.sh
+            displayName: 'Install Dependency Check'
+
+          - script: |
+              echo "Verificando archivos de BD NVD:"
+              ls -lah $(OWASP_CACHE_DIR)
+              echo "Contenido de la carpeta nvd:"
+              ls -lah $(OWASP_CACHE_DIR)/nvd
+              echo "Verificando archivos .json en nvd:"
+              find $(OWASP_CACHE_DIR)/nvd -name "*.json" | head -5
+              
+              dependency-check/bin/dependency-check.sh \
+                --project '$(Build.Repository.Name)' \
+                --scan package-lock.json \
+                --format "HTML" \
+                --data "$(OWASP_CACHE_DIR)/nvd" \
+                --out "./dependency-check-report" \
+                --noupdate \
+                --failOnCVSS 7
+            displayName: 'SCA Analysis'
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: './dependency-check-report'
+              artifactName: 'OWASP-Report-$(Build.Repository.Name)'
+            displayName: 'Publish SCA Report'
+            condition: always()
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Build Artifacts'
+            inputs:
+              PathtoPublish: '$(Build.SourcesDirectory)/dist'
+              ArtifactName: 'BuildArtifacts'
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Artifacts'
+            inputs:
+              PathtoPublish: '$(Build.Repository.LocalPath)/Dockerfile'
+              ArtifactName: 'Artifact'
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Manifest'
+            inputs:
+              PathtoPublish: 'manifest'
+              ArtifactName: 'Manifest'
+
+  - stage: PublishBuildImages
+    displayName: Publish Docker Image to ACR
+    jobs:
+      - job: Build
+        displayName: Build and Publish
+        pool:
+          vmImage: '$(operatingSystem)'
+        variables:
+          - ${{ if eq(variables['Build.SourceBranchName'], 'dev') }}:
+              - name: acrServiceConnection
+                value: acr-dev
+          - ${{ if eq(variables['Build.SourceBranchName'], 'qa') }}:
+              - name: acrServiceConnection
+                value: acr-qa
+          - ${{ if eq(variables['Build.SourceBranchName'], 'main') }}:
+              - name: acrServiceConnection
+                value: acr-prod
+        steps:
+          - checkout: self
+
+          - task: DownloadBuildArtifacts@1
+            displayName: 'Download Build Artifacts'
+            inputs:
+              buildType: 'current'
+              artifactName: 'BuildArtifacts'
+              downloadPath: '$(System.ArtifactsDirectory)'
+
+          - task: CopyFiles@2
+            displayName: 'Copy dist folder'
+            inputs:
+              SourceFolder: '$(System.ArtifactsDirectory)/BuildArtifacts'
+              Contents: '**'
+              TargetFolder: '$(Build.SourcesDirectory)/dist'
+
+          - script: |
+              shortSHA=$(echo "$(Build.SourceVersion)" | cut -c 1-8)
+              echo "##vso[task.setvariable variable=shortSHA]$shortSHA"
+
+              customDate=$(date +'%Y.%m.%d')
+              echo "##vso[task.setvariable variable=customDate]$customDate"
+
+              customVersion="$(Build.BuildId)-$shortSHA-$customDate"
+              echo "##vso[task.setvariable variable=customVersion]$customVersion"
+
+              echo "BuildId: $(Build.BuildId)"
+              echo "SourceVersion: $shortSHA"
+              echo "Date: $customDate"
+              echo "CustomVersion: $customVersion"
+
+              echo "$customVersion" > version.txt
+            displayName: 'set version'
+
+          - script: |
+              appVersion=$(cat version.txt)
+              echo "##vso[task.setvariable variable=appVersion]$appVersion"
+              echo "Versión leída del archivo: $appVersion"
+            displayName: 'read version'
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: 'version.txt'
+              artifactName: 'version-info'
+            displayName: 'Publish Version'
+
+          - task: Docker@2
+            displayName: 'Build an Image'
+            inputs:
+              command: build
+              containerRegistry: ${{variables.acrServiceConnection}}
+              Dockerfile: '**/Dockerfile'
+              repository: '$(Build.Repository.Name)'
+              tags: $(appVersion)
+
+          - task: Docker@2
+            displayName: 'Push an Image'
+            inputs:
+              command: push
+              containerRegistry: ${{variables.acrServiceConnection}}
+              repository: '$(Build.Repository.Name)'
+              tags: $(appVersion)

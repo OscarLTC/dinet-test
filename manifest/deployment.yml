@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: #{APP_NAME}#
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: #{APP_NAME}#
+  minReadySeconds: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: #{APP_NAME}#
+    spec:
+      containers:
+        - name: #{APP_NAME}#
+          image: #{ACR_IMAGE_URL}#
+          imagePullPolicy: Always
+          ports:
+            - containerPort: #{CONTAINER_PORT}#
+          env:
+            - name: MS_GATEWAY_SEVER_IP
+              value: #{MS_GATEWAY_SEVER_IP}#
+          resources:
+            requests:
+              memory: '#{REQUEST_MEMORY}#'
+              cpu: '#{REQUEST_CPU}#'
+            limits:
+              memory: '#{LIMITS_MEMORY}#'
+              cpu: '#{LIMITS_CPU}#'
